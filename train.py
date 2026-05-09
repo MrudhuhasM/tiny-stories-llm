@@ -7,12 +7,15 @@ Usage:
 """
 
 import argparse
+import json
 import sys
 import time
+from dataclasses import asdict
 from pathlib import Path
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 import yaml
 from torch.amp import autocast
 from torch.optim.lr_scheduler import CosineAnnealingLR, LinearLR, SequentialLR
@@ -29,6 +32,168 @@ from story_llm.model import StoryModel
 def load_experiment(path: str) -> dict:
     with open(path) as f:
         return yaml.safe_load(f)
+
+
+# ---------------------------------------------------------------------------
+# Generation
+# ---------------------------------------------------------------------------
+
+# Fixed prompts shared across ALL experiments — keeps qualitative comparisons apples-to-apples
+EVAL_PROMPTS = [
+    "Once upon a time there was a little girl named",
+    "The dragon looked at the castle and said",
+    "Tom and his dog went to the park and",
+    "She opened the box and found a",
+]
+
+
+@torch.inference_mode()
+def generate(
+    model: nn.Module,
+    tokenizer,
+    prompt: str,
+    model_cfg: ModelConfig,
+    device: torch.device,
+    max_new_tokens: int = 200,
+    temperature: float = 0.8,
+    top_k: int = 50,
+) -> str:
+    model.eval()
+    ids = tokenizer.encode(prompt).ids
+    input_ids = torch.tensor(ids, dtype=torch.long, device=device).unsqueeze(0)
+
+    for _ in range(max_new_tokens):
+        # trim to block_size if the context grew too long
+        idx_cond = (
+            input_ids
+            if input_ids.size(1) <= model_cfg.block_size
+            else input_ids[:, -model_cfg.block_size :]
+        )
+
+        with autocast(device_type=device.type, dtype=torch.bfloat16):
+            logits = model(idx_cond)
+
+        logits = logits[:, -1, :] / temperature
+
+        if top_k is not None:
+            v, _ = torch.topk(logits, min(top_k, logits.size(-1)))
+            logits[logits < v[:, [-1]]] = float("-inf")
+
+        probs = F.softmax(logits, dim=-1)
+        next_tok = torch.multinomial(probs, num_samples=1)
+        input_ids = torch.cat([input_ids, next_tok], dim=1)
+
+    return tokenizer.decode(input_ids[0].tolist())
+
+
+def log_generations(
+    model: nn.Module,
+    tokenizer,
+    model_cfg: ModelConfig,
+    device: torch.device,
+    epoch: int,
+    global_step: int,
+    use_wandb: bool,
+    temperature: float = 0.8,
+    top_k: int = 50,
+) -> None:
+    """Generate from fixed prompts and log to stdout (and wandb if enabled)."""
+    raw_model = model._orig_mod if hasattr(model, "_orig_mod") else model
+
+    print(f"\n{'─'*60}")
+    print(f"  Generations after epoch {epoch}")
+    print(f"{'─'*60}")
+
+    rows = []
+    for prompt in EVAL_PROMPTS:
+        generated = generate(
+            raw_model, tokenizer, prompt, model_cfg, device,
+            max_new_tokens=150, temperature=temperature, top_k=top_k,
+        )
+        print(f"\n  PROMPT : {prompt!r}")
+        print(f"  OUTPUT : {generated!r}")
+        rows.append((epoch, global_step, prompt, generated, temperature, top_k))
+
+    print(f"{'─'*60}\n")
+
+    if use_wandb:
+        import wandb
+        columns = ["epoch", "step", "prompt", "generated", "temperature", "top_k"]
+        table = wandb.Table(columns=columns)
+        for row in rows:
+            table.add_data(*row)
+        wandb.log({"generations": table}, step=global_step)
+
+
+# ---------------------------------------------------------------------------
+# HuggingFace Hub
+# ---------------------------------------------------------------------------
+
+
+def push_to_hub(
+    model: nn.Module,
+    model_cfg: ModelConfig,
+    exp_name: str,
+    ckpt_path: Path,
+    tokenizer_dir: Path,
+    hub_repo_id: str,
+) -> None:
+    """
+    Push to a single shared HF Hub repo (e.g. "username/story-llm").
+
+    Layout inside the repo:
+        tokenizer/tiny_stories_tokenizer.json  ← uploaded once per run
+        exp01-post-norm/model.pth
+        exp01-post-norm/config.json
+        exp02-pre-norm/model.pth
+        ...
+    """
+    try:
+        from huggingface_hub import HfApi
+    except ImportError:
+        print("  [hub] huggingface_hub not installed — skipping push")
+        return
+
+    api = HfApi()
+    api.create_repo(repo_id=hub_repo_id, exist_ok=True, private=True)
+
+    # prefix for all files belonging to this experiment
+    prefix = exp_name  # e.g. "exp01-post-norm"
+
+    # --- model weights ---
+    raw_model = model._orig_mod if hasattr(model, "_orig_mod") else model
+    weights_path = ckpt_path.with_suffix(".pth")
+    torch.save(raw_model.state_dict(), weights_path)
+
+    # --- config ---
+    cfg_dict = asdict(model_cfg)
+    config_path = ckpt_path.with_suffix(".json")
+    with open(config_path, "w") as f:
+        json.dump(cfg_dict, f, indent=2)
+
+    # --- upload model + config ---
+    uploads: list[tuple[str, str]] = [
+        (str(weights_path), f"{prefix}/model.pth"),
+        (str(config_path),  f"{prefix}/config.json"),
+    ]
+
+    # --- tokenizer (shared across experiments, safe to re-upload) ---
+    from story_llm.data import TOKENIZER_FILENAME
+    tok_local = tokenizer_dir / TOKENIZER_FILENAME
+    if tok_local.exists():
+        uploads.append((str(tok_local), f"tokenizer/{TOKENIZER_FILENAME}"))
+    else:
+        print("  [hub] tokenizer file not found — skipping tokenizer upload")
+
+    for local, remote in uploads:
+        api.upload_file(
+            path_or_fileobj=local,
+            path_in_repo=remote,
+            repo_id=hub_repo_id,
+        )
+        print(f"  [hub] uploaded {remote}")
+
+    print(f"  ✓ Pushed to https://huggingface.co/{hub_repo_id}")
 
 
 # ---------------------------------------------------------------------------
@@ -139,6 +304,7 @@ def main() -> None:
     description: str = cfg_dict.get("description", "")
     wandb_run_name: str = cfg_dict.get("wandb_run_name", exp_name)
     wandb_project: str = cfg_dict.get("wandb_project", "story-llm")
+    hub_repo_id: str | None = cfg_dict.get("hub_repo_id")  # e.g. "your-username/story-llm" (one repo, all experiments)
 
     train_cfg = TrainConfig(**cfg_dict["train"])
     model_cfg_dict: dict = cfg_dict["model"]  # vocab_size filled after tokenizer
@@ -230,6 +396,7 @@ def main() -> None:
 
     # Training loop
     best_val_loss = float("inf")
+    global_step = 0
 
     for epoch in range(train_cfg.num_epochs):
         print(f"\n--- Epoch {epoch + 1}/{train_cfg.num_epochs} ---")
@@ -238,6 +405,16 @@ def main() -> None:
             device, epoch, train_cfg, use_wandb,
         )
         val_loss, val_ppl = evaluate(model, val_loader, criterion, device)
+
+        global_step += len(train_loader)
+
+        # qualitative samples — same prompts every experiment, every epoch
+        log_generations(
+            model, tokenizer, model_cfg, device,
+            epoch=epoch + 1,
+            global_step=global_step,
+            use_wandb=use_wandb,
+        )
 
         print(
             f"\n[Epoch {epoch + 1}] "
@@ -254,7 +431,7 @@ def main() -> None:
                     "epoch/val_loss": val_loss,
                     "epoch/val_ppl": val_ppl,
                 },
-                step=(epoch + 1) * len(train_loader),
+                step=global_step,
             )
 
         if val_loss < best_val_loss:
@@ -263,7 +440,7 @@ def main() -> None:
             torch.save(
                 {
                     "epoch": epoch + 1,
-                    "model_state": model.state_dict(),
+                    "model_state": (model._orig_mod if hasattr(model, "_orig_mod") else model).state_dict(),
                     "optimizer_state": optimizer.state_dict(),
                     "val_loss": val_loss,
                     "model_config": model_cfg.__dict__,
@@ -273,6 +450,9 @@ def main() -> None:
                 ckpt,
             )
             print(f"  ✓ Checkpoint saved → {ckpt}")
+
+            if hub_repo_id:
+                push_to_hub(model, model_cfg, exp_name, ckpt, tokenizer_dir, hub_repo_id)
 
     if use_wandb:
         import wandb

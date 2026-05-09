@@ -6,6 +6,7 @@ description: >
 
 wandb_run_name: "E2-pre-norm"
 wandb_project: "story-llm"
+hub_repo_id: mrudhuhas/tiny-stories-llm   # set to "your-username/story-llm" — one repo for all experiments
 
 model:
   block_size: 512

@@ -1,0 +1,32 @@
+name: "exp01-post-norm"
+description: >
+  Baseline GPT-style decoder-only LLM with Post-LayerNorm (original GPT-2 style).
+  6 layers, 8 heads, d_model=512. Serves as the reference for all subsequent experiments.
+
+wandb_run_name: "E1-post-norm-baseline"
+wandb_project: "story-llm"
+
+model:
+  block_size: 512
+  n_layers: 6
+  n_heads: 8
+  d_model: 512
+  d_ffn: 2048
+  attn_dropout: 0.1
+  ffn_dropout: 0.1
+  bias: true
+  pre_norm: false          # Post-LayerNorm (GPT-2 style)
+
+train:
+  num_epochs: 3
+  batch_size: 32
+  learning_rate: 1.0e-4
+  train_size: 200000
+  test_size: 10000
+  max_len: 512
+  stride: 128
+  warmup_ratio: 0.02
+  grad_clip: 1.0
+  log_interval: 100
+  num_workers: 4
+  seed: 42

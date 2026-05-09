@@ -1,0 +1,33 @@
+name: "exp02-pre-norm"
+description: >
+  Same architecture as exp01, but with Pre-LayerNorm (modern style used in GPT-3,
+  LLaMA, etc.). Pre-norm typically trains more stably and allows higher learning rates.
+  Only change from exp01: pre_norm: true.
+
+wandb_run_name: "E2-pre-norm"
+wandb_project: "story-llm"
+
+model:
+  block_size: 512
+  n_layers: 6
+  n_heads: 8
+  d_model: 512
+  d_ffn: 2048
+  attn_dropout: 0.1
+  ffn_dropout: 0.1
+  bias: true
+  pre_norm: true           # Pre-LayerNorm (GPT-3 / LLaMA style)
+
+train:
+  num_epochs: 3
+  batch_size: 32
+  learning_rate: 1.0e-4
+  train_size: 200000
+  test_size: 10000
+  max_len: 512
+  stride: 128
+  warmup_ratio: 0.02
+  grad_clip: 1.0
+  log_interval: 100
+  num_workers: 4
+  seed: 42

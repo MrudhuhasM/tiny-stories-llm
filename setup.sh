@@ -34,8 +34,7 @@ source .venv/bin/activate
 # Detect CUDA version and pick the matching wheel index.
 # Adjust cu124 → cu118 / cu121 if your RunPod image uses a different CUDA.
 echo "[3/4] Installing PyTorch (CUDA 12.4)..."
-TORCH_INDEX="https://download.pytorch.org/whl/cu124"
-uv pip install torch --index-url "$TORCH_INDEX" -q
+uv pip install torch 
 
 # --- 4. Install project + remaining dependencies ----------------------------
 echo "[4/4] Installing story-llm and dependencies..."

@@ -27,7 +27,7 @@ fi
 
 # --- 2. Create virtual environment ------------------------------------------
 echo "[2/4] Creating .venv..."
-uv venv --python 3.11
+uv venv --python 3.13
 source .venv/bin/activate
 
 # --- 3. Install PyTorch with CUDA -------------------------------------------
